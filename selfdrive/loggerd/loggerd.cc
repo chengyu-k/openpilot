@@ -6,7 +6,6 @@ ExitHandler do_exit;
 struct LoggerdState {
   LoggerState logger = {};
   char segment_path[4096];
-  std::mutex rotate_lock;
   std::atomic<int> rotate_segment;
   std::atomic<double> last_camera_seen_tms;
   std::atomic<int> ready_to_rotate;  // count of encoders ready to rotate
@@ -15,15 +14,12 @@ struct LoggerdState {
 };
 
 void logger_rotate(LoggerdState *s) {
-  {
-    std::unique_lock lk(s->rotate_lock);
-    int segment = -1;
-    int err = logger_next(&s->logger, LOG_ROOT.c_str(), s->segment_path, sizeof(s->segment_path), &segment);
-    assert(err == 0);
-    s->rotate_segment = segment;
-    s->ready_to_rotate = 0;
-    s->last_rotate_tms = millis_since_boot();
-  }
+  int segment = -1;
+  int err = logger_next(&s->logger, LOG_ROOT.c_str(), s->segment_path, sizeof(s->segment_path), &segment);
+  assert(err == 0);
+  s->rotate_segment = segment;
+  s->ready_to_rotate = 0;
+  s->last_rotate_tms = millis_since_boot();
   LOGW((s->logger.part == 0) ? "logging to %s" : "rotated to %s", s->segment_path);
 }
 
@@ -59,7 +55,7 @@ int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct 
   int bytes_count = 0;
 
   // extract the message
-  capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize()));
+  capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize() / sizeof(capnp::word)));
   auto event = cmsg.getRoot<cereal::Event>();
   auto edata = (name == "driverEncodeData") ? event.getDriverEncodeData() :
     ((name == "wideRoadEncodeData") ? event.getWideRoadEncodeData() :
@@ -208,10 +204,8 @@ void loggerd_thread() {
   // init encoders
   s.last_camera_seen_tms = millis_since_boot();
   for (const auto &cam : cameras_logged) {
-    if (cam.enable) {
-      s.max_waiting++;
-      if (cam.has_qcamera) { s.max_waiting++; }
-    }
+    s.max_waiting++;
+    if (cam.has_qcamera) { s.max_waiting++; }
   }
 
   uint64_t msg_count = 0, bytes_count = 0;

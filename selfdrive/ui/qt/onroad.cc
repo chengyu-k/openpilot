@@ -18,13 +18,23 @@ OnroadWindow::OnroadWindow(QWidget *parent) : QWidget(parent) {
   stacked_layout->setStackingMode(QStackedLayout::StackAll);
   main_layout->addLayout(stacked_layout);
 
-  nvg = new NvgWindow(VISION_STREAM_ROAD, this);
+  nvg = new AnnotatedCameraWidget(VISION_STREAM_ROAD, this);
 
   QWidget * split_wrapper = new QWidget;
   split = new QHBoxLayout(split_wrapper);
   split->setContentsMargins(0, 0, 0, 0);
   split->setSpacing(0);
   split->addWidget(nvg);
+
+  if (getenv("DUAL_CAMERA_VIEW")) {
+    CameraWidget *arCam = new CameraWidget("camerad", VISION_STREAM_ROAD, true, this);
+    split->insertWidget(0, arCam);
+  }
+
+  if (getenv("MAP_RENDER_VIEW")) {
+    CameraWidget *map_render = new CameraWidget("navd", VISION_STREAM_MAP, false, this);
+    split->insertWidget(0, map_render);
+  }
 
   stacked_layout->addWidget(split_wrapper);
 
@@ -50,6 +60,12 @@ void OnroadWindow::updateState(const UIState &s) {
       bgColor = bg_colors[STATUS_DISENGAGED];
     }
     alerts->updateAlert(alert, bgColor);
+  }
+
+  if (s.scene.map_on_left) {
+    split->setDirection(QBoxLayout::LeftToRight);
+  } else {
+    split->setDirection(QBoxLayout::RightToLeft);
   }
 
   nvg->updateState(s);
@@ -80,7 +96,7 @@ void OnroadWindow::offroadTransition(bool offroad) {
       QObject::connect(uiState(), &UIState::offroadTransition, m, &MapWindow::offroadTransition);
 
       m->setFixedWidth(topWidget(this)->width() / 2);
-      split->addWidget(m, 0, Qt::AlignRight);
+      split->insertWidget(0, m);
 
       // Make map visible after adding to split
       m->offroadTransition(offroad);
@@ -89,10 +105,6 @@ void OnroadWindow::offroadTransition(bool offroad) {
 #endif
 
   alerts->updateAlert({}, bg);
-
-  // update stream type
-  bool wide_cam = Params().getBool("WideCameraOnly");
-  nvg->setStreamType(wide_cam ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD);
 }
 
 void OnroadWindow::paintEvent(QPaintEvent *event) {
@@ -146,53 +158,72 @@ void OnroadAlerts::paintEvent(QPaintEvent *event) {
   p.setPen(QColor(0xff, 0xff, 0xff));
   p.setRenderHint(QPainter::TextAntialiasing);
   if (alert.size == cereal::ControlsState::AlertSize::SMALL) {
-    configFont(p, "Open Sans", 74, "SemiBold");
+    configFont(p, "Inter", 74, "SemiBold");
     p.drawText(r, Qt::AlignCenter, alert.text1);
   } else if (alert.size == cereal::ControlsState::AlertSize::MID) {
-    configFont(p, "Open Sans", 88, "Bold");
+    configFont(p, "Inter", 88, "Bold");
     p.drawText(QRect(0, c.y() - 125, width(), 150), Qt::AlignHCenter | Qt::AlignTop, alert.text1);
-    configFont(p, "Open Sans", 66, "Regular");
+    configFont(p, "Inter", 66, "Regular");
     p.drawText(QRect(0, c.y() + 21, width(), 90), Qt::AlignHCenter, alert.text2);
   } else if (alert.size == cereal::ControlsState::AlertSize::FULL) {
     bool l = alert.text1.length() > 15;
-    configFont(p, "Open Sans", l ? 132 : 177, "Bold");
+    configFont(p, "Inter", l ? 132 : 177, "Bold");
     p.drawText(QRect(0, r.y() + (l ? 240 : 270), width(), 600), Qt::AlignHCenter | Qt::TextWordWrap, alert.text1);
-    configFont(p, "Open Sans", 88, "Regular");
+    configFont(p, "Inter", 88, "Regular");
     p.drawText(QRect(0, r.height() - (l ? 361 : 420), width(), 300), Qt::AlignHCenter | Qt::TextWordWrap, alert.text2);
   }
 }
 
-// NvgWindow
 
-NvgWindow::NvgWindow(VisionStreamType type, QWidget* parent) : fps_filter(UI_FREQ, 3, 1. / UI_FREQ), CameraViewWidget("camerad", type, true, parent) {
+AnnotatedCameraWidget::AnnotatedCameraWidget(VisionStreamType type, QWidget* parent) : fps_filter(UI_FREQ, 3, 1. / UI_FREQ), CameraWidget("camerad", type, true, parent) {
+  pm = std::make_unique<PubMaster, const std::initializer_list<const char *>>({"uiDebug"});
+
   engage_img = loadPixmap("../assets/img_chffr_wheel.png", {img_size, img_size});
+  experimental_img = loadPixmap("../assets/img_experimental.svg", {img_size - 5, img_size - 5});
   dm_img = loadPixmap("../assets/img_driver_face.png", {img_size, img_size});
 }
 
-void NvgWindow::updateState(const UIState &s) {
+void AnnotatedCameraWidget::updateState(const UIState &s) {
   const int SET_SPEED_NA = 255;
   const SubMaster &sm = *(s.sm);
+
+  const bool cs_alive = sm.alive("controlsState");
+  const bool nav_alive = sm.alive("navInstruction") && sm["navInstruction"].getValid();
+
   const auto cs = sm["controlsState"].getControlsState();
 
-  float set_speed = cs.getVCruise();
+  // Handle older routes where vCruiseCluster is not set
+  float v_cruise =  cs.getVCruiseCluster() == 0.0 ? cs.getVCruise() : cs.getVCruiseCluster();
+  float set_speed = cs_alive ? v_cruise : SET_SPEED_NA;
   bool cruise_set = set_speed > 0 && (int)set_speed != SET_SPEED_NA;
   if (cruise_set && !s.scene.is_metric) {
     set_speed *= KM_TO_MILE;
   }
-  float cur_speed = std::max(0.0, sm["carState"].getCarState().getVEgo() * (s.scene.is_metric ? MS_TO_KPH : MS_TO_MPH));
+
+  // Handle older routes where vEgoCluster is not set
+  float v_ego;
+  if (sm["carState"].getCarState().getVEgoCluster() == 0.0 && !v_ego_cluster_seen) {
+    v_ego = sm["carState"].getCarState().getVEgo();
+  } else {
+    v_ego = sm["carState"].getCarState().getVEgoCluster();
+    v_ego_cluster_seen = true;
+  }
+  float cur_speed = cs_alive ? std::max<float>(0.0, v_ego) : 0.0;
+  cur_speed *= s.scene.is_metric ? MS_TO_KPH : MS_TO_MPH;
 
   auto speed_limit_sign = sm["navInstruction"].getNavInstruction().getSpeedLimitSign();
-  float speed_limit = sm["navInstruction"].getValid() ? sm["navInstruction"].getNavInstruction().getSpeedLimit() : 0.0;
+  float speed_limit = nav_alive ? sm["navInstruction"].getNavInstruction().getSpeedLimit() : 0.0;
   speed_limit *= (s.scene.is_metric ? MS_TO_KPH : MS_TO_MPH);
 
   setProperty("speedLimit", speed_limit);
-  setProperty("has_us_speed_limit", sm["navInstruction"].getValid() && speed_limit_sign == cereal::NavInstruction::SpeedLimitSign::MUTCD);
-  setProperty("has_eu_speed_limit", sm["navInstruction"].getValid() && speed_limit_sign == cereal::NavInstruction::SpeedLimitSign::VIENNA);
+  setProperty("has_us_speed_limit", nav_alive && speed_limit_sign == cereal::NavInstruction::SpeedLimitSign::MUTCD);
+  setProperty("has_eu_speed_limit", nav_alive && speed_limit_sign == cereal::NavInstruction::SpeedLimitSign::VIENNA);
 
   setProperty("is_cruise_set", cruise_set);
+  setProperty("is_metric", s.scene.is_metric);
   setProperty("speed", cur_speed);
   setProperty("setSpeed", set_speed);
-  setProperty("speedUnit", s.scene.is_metric ? "km/h" : "mph");
+  setProperty("speedUnit", s.scene.is_metric ? tr("km/h") : tr("mph"));
   setProperty("hideDM", cs.getAlertSize() != cereal::ControlsState::AlertSize::NONE);
   setProperty("status", s.status);
 
@@ -200,10 +231,11 @@ void NvgWindow::updateState(const UIState &s) {
   if (sm.frame % (UI_FREQ / 2) == 0) {
     setProperty("engageable", cs.getEngageable() || cs.getEnabled());
     setProperty("dmActive", sm["driverMonitoringState"].getDriverMonitoringState().getIsActiveMode());
+    setProperty("rightHandDM", sm["driverMonitoringState"].getDriverMonitoringState().getIsRHD());
   }
 }
 
-void NvgWindow::drawHud(QPainter &p) {
+void AnnotatedCameraWidget::drawHud(QPainter &p) {
   p.save();
 
   // Header gradient
@@ -219,8 +251,8 @@ void NvgWindow::drawHud(QPainter &p) {
   // Draw outer box + border to contain set speed and speed limit
   int default_rect_width = 172;
   int rect_width = default_rect_width;
+  if (is_metric || has_eu_speed_limit) rect_width = 200;
   if (has_us_speed_limit && speedLimitStr.size() >= 3) rect_width = 223;
-  else if (has_eu_speed_limit) rect_width = 200;
 
   int rect_height = 204;
   if (has_us_speed_limit) rect_height = 402;
@@ -233,26 +265,6 @@ void NvgWindow::drawHud(QPainter &p) {
   p.setPen(QPen(whiteColor(75), 6));
   p.setBrush(blackColor(166));
   drawRoundedRect(p, set_speed_rect, top_radius, top_radius, bottom_radius, bottom_radius);
-
-  // Draw set speed
-  if (is_cruise_set) {
-    if (speedLimit > 0 && status != STATUS_DISENGAGED && status != STATUS_OVERRIDE) {
-      p.setPen(interpColor(
-        setSpeed,
-        {speedLimit + 5, speedLimit + 15, speedLimit + 25},
-        {whiteColor(), QColor(0xff, 0x95, 0x00, 0xff), QColor(0xff, 0x00, 0x00, 0xff)}
-      ));
-    } else {
-      p.setPen(whiteColor());
-    }
-  } else {
-    p.setPen(QColor(0x72, 0x72, 0x72, 0xff));
-  }
-  configFont(p, "Open Sans", 90, "Bold");
-  QRect speed_rect = getTextRect(p, Qt::AlignCenter, setSpeedStr);
-  speed_rect.moveCenter({set_speed_rect.center().x(), 0});
-  speed_rect.moveTop(set_speed_rect.top() + 8);
-  p.drawText(speed_rect, Qt::AlignCenter, setSpeedStr);
 
   // Draw MAX
   if (is_cruise_set) {
@@ -272,16 +284,38 @@ void NvgWindow::drawHud(QPainter &p) {
   } else {
     p.setPen(QColor(0xa6, 0xa6, 0xa6, 0xff));
   }
-  configFont(p, "Open Sans", 40, "SemiBold");
-  QRect max_rect = getTextRect(p, Qt::AlignCenter, "MAX");
+  configFont(p, "Inter", 40, "SemiBold");
+  QRect max_rect = getTextRect(p, Qt::AlignCenter, tr("MAX"));
   max_rect.moveCenter({set_speed_rect.center().x(), 0});
-  max_rect.moveTop(set_speed_rect.top() + 123);
-  p.drawText(max_rect, Qt::AlignCenter, "MAX");
+  max_rect.moveTop(set_speed_rect.top() + 27);
+  p.drawText(max_rect, Qt::AlignCenter, tr("MAX"));
+
+  // Draw set speed
+  if (is_cruise_set) {
+    if (speedLimit > 0 && status != STATUS_DISENGAGED && status != STATUS_OVERRIDE) {
+      p.setPen(interpColor(
+        setSpeed,
+        {speedLimit + 5, speedLimit + 15, speedLimit + 25},
+        {whiteColor(), QColor(0xff, 0x95, 0x00, 0xff), QColor(0xff, 0x00, 0x00, 0xff)}
+      ));
+    } else {
+      p.setPen(whiteColor());
+    }
+  } else {
+    p.setPen(QColor(0x72, 0x72, 0x72, 0xff));
+  }
+  configFont(p, "Inter", 90, "Bold");
+  QRect speed_rect = getTextRect(p, Qt::AlignCenter, setSpeedStr);
+  speed_rect.moveCenter({set_speed_rect.center().x(), 0});
+  speed_rect.moveTop(set_speed_rect.top() + 77);
+  p.drawText(speed_rect, Qt::AlignCenter, setSpeedStr);
+
+
 
   // US/Canada (MUTCD style) sign
   if (has_us_speed_limit) {
     const int border_width = 6;
-    const int sign_width = (speedLimitStr.size() >= 3) ? 199 : 148;
+    const int sign_width = rect_width - 24;
     const int sign_height = 186;
 
     // White outer square
@@ -297,23 +331,23 @@ void NvgWindow::drawHud(QPainter &p) {
     p.drawRoundedRect(sign_rect, 16, 16);
 
     // "SPEED"
-    configFont(p, "Open Sans", 28, "SemiBold");
-    QRect text_speed_rect = getTextRect(p, Qt::AlignCenter, "SPEED");
+    configFont(p, "Inter", 28, "SemiBold");
+    QRect text_speed_rect = getTextRect(p, Qt::AlignCenter, tr("SPEED"));
     text_speed_rect.moveCenter({sign_rect.center().x(), 0});
-    text_speed_rect.moveTop(sign_rect_outer.top() + 20);
-    p.drawText(text_speed_rect, Qt::AlignCenter, "SPEED");
+    text_speed_rect.moveTop(sign_rect_outer.top() + 22);
+    p.drawText(text_speed_rect, Qt::AlignCenter, tr("SPEED"));
 
     // "LIMIT"
-    QRect text_limit_rect = getTextRect(p, Qt::AlignCenter, "LIMIT");
+    QRect text_limit_rect = getTextRect(p, Qt::AlignCenter, tr("LIMIT"));
     text_limit_rect.moveCenter({sign_rect.center().x(), 0});
-    text_limit_rect.moveTop(sign_rect_outer.top() + 48);
-    p.drawText(text_limit_rect, Qt::AlignCenter, "LIMIT");
+    text_limit_rect.moveTop(sign_rect_outer.top() + 51);
+    p.drawText(text_limit_rect, Qt::AlignCenter, tr("LIMIT"));
 
     // Speed limit value
-    configFont(p, "Open Sans", 70, "Bold");
+    configFont(p, "Inter", 70, "Bold");
     QRect speed_limit_rect = getTextRect(p, Qt::AlignCenter, speedLimitStr);
     speed_limit_rect.moveCenter({sign_rect.center().x(), 0});
-    speed_limit_rect.moveTop(sign_rect.top() + 70);
+    speed_limit_rect.moveTop(sign_rect_outer.top() + 85);
     p.drawText(speed_limit_rect, Qt::AlignCenter, speedLimitStr);
   }
 
@@ -334,10 +368,8 @@ void NvgWindow::drawHud(QPainter &p) {
     p.drawEllipse(center, inner_radius_2, inner_radius_2);
 
     // Speed limit value
-    if (speedLimit < 1 ) center -= {0, 2}; // Make sure dash is centered if no speed limit available
-
-    int font_size = (speedLimitStr.size() >= 3) ? 62 : 70;
-    configFont(p, "Open Sans", font_size, "Bold");
+    int font_size = (speedLimitStr.size() >= 3) ? 60 : 70;
+    configFont(p, "Inter", font_size, "Bold");
     QRect speed_limit_rect = getTextRect(p, Qt::AlignCenter, speedLimitStr);
     speed_limit_rect.moveCenter(center);
     p.setPen(blackColor());
@@ -345,26 +377,32 @@ void NvgWindow::drawHud(QPainter &p) {
   }
 
   // current speed
-  configFont(p, "Open Sans", 176, "Bold");
+  configFont(p, "Inter", 176, "Bold");
   drawText(p, rect().center().x(), 210, speedStr);
-  configFont(p, "Open Sans", 66, "Regular");
+  configFont(p, "Inter", 66, "Regular");
   drawText(p, rect().center().x(), 290, speedUnit, 200);
 
   // engage-ability icon
   if (engageable) {
+    SubMaster &sm = *(uiState()->sm);
     drawIcon(p, rect().right() - radius / 2 - bdr_s * 2, radius / 2 + int(bdr_s * 1.5),
-             engage_img, bg_colors[status], 1.0);
+             sm["controlsState"].getControlsState().getExperimentalMode() ? experimental_img : engage_img, blackColor(166), 1.0);
   }
 
   // dm icon
   if (!hideDM) {
-    drawIcon(p, radius / 2 + (bdr_s * 2), rect().bottom() - footer_h / 2,
+    int dm_icon_x = rightHandDM ? rect().right() -  radius / 2 - (bdr_s * 2) : radius / 2 + (bdr_s * 2);
+    drawIcon(p, dm_icon_x, rect().bottom() - footer_h / 2,
              dm_img, blackColor(70), dmActive ? 1.0 : 0.2);
   }
   p.restore();
 }
 
-void NvgWindow::drawText(QPainter &p, int x, int y, const QString &text, int alpha) {
+
+// Window that shows camera view and variety of
+// info drawn on top
+
+void AnnotatedCameraWidget::drawText(QPainter &p, int x, int y, const QString &text, int alpha) {
   QRect real_rect = getTextRect(p, 0, text);
   real_rect.moveCenter({x, y - real_rect.height() / 2});
 
@@ -372,17 +410,18 @@ void NvgWindow::drawText(QPainter &p, int x, int y, const QString &text, int alp
   p.drawText(real_rect.x(), real_rect.bottom(), text);
 }
 
-void NvgWindow::drawIcon(QPainter &p, int x, int y, QPixmap &img, QBrush bg, float opacity) {
+void AnnotatedCameraWidget::drawIcon(QPainter &p, int x, int y, QPixmap &img, QBrush bg, float opacity) {
+  p.setOpacity(1.0);  // bg dictates opacity of ellipse
   p.setPen(Qt::NoPen);
   p.setBrush(bg);
   p.drawEllipse(x - radius / 2, y - radius / 2, radius, radius);
   p.setOpacity(opacity);
-  p.drawPixmap(x - img_size / 2, y - img_size / 2, img);
+  p.drawPixmap(x - img.size().width() / 2, y - img.size().height() / 2, img);
 }
 
 
-void NvgWindow::initializeGL() {
-  CameraViewWidget::initializeGL();
+void AnnotatedCameraWidget::initializeGL() {
+  CameraWidget::initializeGL();
   qInfo() << "OpenGL version:" << QString((const char*)glGetString(GL_VERSION));
   qInfo() << "OpenGL vendor:" << QString((const char*)glGetString(GL_VENDOR));
   qInfo() << "OpenGL renderer:" << QString((const char*)glGetString(GL_RENDERER));
@@ -392,65 +431,74 @@ void NvgWindow::initializeGL() {
   setBackgroundColor(bg_colors[STATUS_DISENGAGED]);
 }
 
-void NvgWindow::updateFrameMat(int w, int h) {
-  CameraViewWidget::updateFrameMat(w, h);
-
+void AnnotatedCameraWidget::updateFrameMat() {
+  CameraWidget::updateFrameMat();
   UIState *s = uiState();
+  int w = width(), h = height();
+
   s->fb_w = w;
   s->fb_h = h;
-  auto intrinsic_matrix = s->wide_camera ? ecam_intrinsic_matrix : fcam_intrinsic_matrix;
-  float zoom = ZOOM / intrinsic_matrix.v[0];
-  if (s->wide_camera) {
-    zoom *= 0.5;
-  }
+
   // Apply transformation such that video pixel coordinates match video
   // 1) Put (0, 0) in the middle of the video
   // 2) Apply same scaling as video
   // 3) Put (0, 0) in top left corner of video
   s->car_space_transform.reset();
-  s->car_space_transform.translate(w / 2, h / 2 + y_offset)
+  s->car_space_transform.translate(w / 2 - x_offset, h / 2 - y_offset)
       .scale(zoom, zoom)
       .translate(-intrinsic_matrix.v[2], -intrinsic_matrix.v[5]);
 }
 
-void NvgWindow::drawLaneLines(QPainter &painter, const UIState *s) {
+void AnnotatedCameraWidget::drawLaneLines(QPainter &painter, const UIState *s) {
   painter.save();
 
   const UIScene &scene = s->scene;
+  SubMaster &sm = *(s->sm);
+
   // lanelines
   for (int i = 0; i < std::size(scene.lane_line_vertices); ++i) {
     painter.setBrush(QColor::fromRgbF(1.0, 1.0, 1.0, std::clamp<float>(scene.lane_line_probs[i], 0.0, 0.7)));
-    painter.drawPolygon(scene.lane_line_vertices[i].v, scene.lane_line_vertices[i].cnt);
+    painter.drawPolygon(scene.lane_line_vertices[i]);
   }
 
   // road edges
   for (int i = 0; i < std::size(scene.road_edge_vertices); ++i) {
     painter.setBrush(QColor::fromRgbF(1.0, 0, 0, std::clamp<float>(1.0 - scene.road_edge_stds[i], 0.0, 1.0)));
-    painter.drawPolygon(scene.road_edge_vertices[i].v, scene.road_edge_vertices[i].cnt);
+    painter.drawPolygon(scene.road_edge_vertices[i]);
   }
 
   // paint path
   QLinearGradient bg(0, height(), 0, height() / 4);
-  const auto &orientation = (*s->sm)["modelV2"].getModelV2().getOrientation();
-  float orientation_future = 0;
-  if (orientation.getZ().size() > 16) {
-    orientation_future = std::abs(orientation.getZ()[16]);  // 2.5 seconds
-  }
-  // straight: 112, in turns: 70
-  float curve_hue = fmax(70, 112 - (orientation_future * 420));
-  // FIXME: painter.drawPolygon can be slow if hue is not rounded
-  curve_hue = int(curve_hue * 100 + 0.5) / 100;
+  float start_hue, end_hue;
+  if (sm["controlsState"].getControlsState().getExperimentalMode()) {
+    const auto &acceleration = sm["modelV2"].getModelV2().getAcceleration();
+    float acceleration_future = 0;
+    if (acceleration.getZ().size() > 16) {
+      acceleration_future = acceleration.getX()[16];  // 2.5 seconds
+    }
+    start_hue = 60;
+    // speed up: 120, slow down: 0
+    end_hue = fmax(fmin(start_hue + acceleration_future * 45, 148), 0);
 
-  bg.setColorAt(0.0, QColor::fromHslF(148 / 360., 0.94, 0.51, 0.4));
-  bg.setColorAt(0.75 / 1.5, QColor::fromHslF(curve_hue / 360., 1.0, 0.68, 0.35));
-  bg.setColorAt(1.0, QColor::fromHslF(curve_hue / 360., 1.0, 0.68, 0.0));
+    // FIXME: painter.drawPolygon can be slow if hue is not rounded
+    end_hue = int(end_hue * 100 + 0.5) / 100;
+
+    bg.setColorAt(0.0, QColor::fromHslF(start_hue / 360., 0.97, 0.56, 0.4));
+    bg.setColorAt(0.5, QColor::fromHslF(end_hue / 360., 1.0, 0.68, 0.35));
+    bg.setColorAt(1.0, QColor::fromHslF(end_hue / 360., 1.0, 0.68, 0.0));
+  } else {
+    bg.setColorAt(0.0, QColor::fromHslF(148 / 360., 0.94, 0.51, 0.4));
+    bg.setColorAt(0.5, QColor::fromHslF(112 / 360., 1.0, 0.68, 0.35));
+    bg.setColorAt(1.0, QColor::fromHslF(112 / 360., 1.0, 0.68, 0.0));
+  }
+
   painter.setBrush(bg);
-  painter.drawPolygon(scene.track_vertices.v, scene.track_vertices.cnt);
+  painter.drawPolygon(scene.track_vertices);
 
   painter.restore();
 }
 
-void NvgWindow::drawLead(QPainter &painter, const cereal::ModelDataV2::LeadDataV3::Reader &lead_data, const QPointF &vd) {
+void AnnotatedCameraWidget::drawLead(QPainter &painter, const cereal::ModelDataV2::LeadDataV3::Reader &lead_data, const QPointF &vd) {
   painter.save();
 
   const float speedBuff = 10.;
@@ -486,17 +534,64 @@ void NvgWindow::drawLead(QPainter &painter, const cereal::ModelDataV2::LeadDataV
   painter.restore();
 }
 
-void NvgWindow::paintGL() {
+void AnnotatedCameraWidget::paintGL() {
   UIState *s = uiState();
-  const cereal::ModelDataV2::Reader &model = (*s->sm)["modelV2"].getModelV2();
-  CameraViewWidget::setFrameId(model.getFrameId());
-  CameraViewWidget::paintGL();
+  SubMaster &sm = *(s->sm);
+  const double start_draw_t = millis_since_boot();
+  const cereal::ModelDataV2::Reader &model = sm["modelV2"].getModelV2();
+
+  // draw camera frame
+  {
+    std::lock_guard lk(frame_lock);
+
+    if (frames.empty()) {
+      if (skip_frame_count > 0) {
+        skip_frame_count--;
+        qDebug() << "skipping frame, not ready";
+        return;
+      }
+    } else {
+      // skip drawing up to this many frames if we're
+      // missing camera frames. this smooths out the
+      // transitions from the narrow and wide cameras
+      skip_frame_count = 5;
+    }
+
+    // Wide or narrow cam dependent on speed
+    float v_ego = sm["carState"].getCarState().getVEgo();
+    if ((v_ego < 10) || s->wide_cam_only) {
+      wide_cam_requested = true;
+    } else if (v_ego > 15) {
+      wide_cam_requested = false;
+    }
+    wide_cam_requested = wide_cam_requested && sm["controlsState"].getControlsState().getExperimentalMode();
+    // TODO: also detect when ecam vision stream isn't available
+    // for replay of old routes, never go to widecam
+    wide_cam_requested = wide_cam_requested && s->scene.calibration_wide_valid;
+    CameraWidget::setStreamType(wide_cam_requested ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD);
+
+    s->scene.wide_cam = CameraWidget::getStreamType() == VISION_STREAM_WIDE_ROAD;
+    if (s->scene.calibration_valid) {
+      auto calib = s->scene.wide_cam ? s->scene.view_from_wide_calib : s->scene.view_from_calib;
+      CameraWidget::updateCalibration(calib);
+    } else {
+      CameraWidget::updateCalibration(DEFAULT_CALIBRATION);
+    }
+    CameraWidget::setFrameId(model.getFrameId());
+    CameraWidget::paintGL();
+  }
 
   QPainter painter(this);
   painter.setRenderHint(QPainter::Antialiasing);
   painter.setPen(Qt::NoPen);
 
   if (s->worldObjectsVisible()) {
+    if (sm.rcv_frame("modelV2") > s->scene.started_frame) {
+      update_model(s, sm["modelV2"].getModelV2());
+      if (sm.rcv_frame("radarState") > s->scene.started_frame) {
+        update_leads(s, sm["radarState"].getRadarState(), sm["modelV2"].getModelV2().getPosition());
+      }
+    }
 
     drawLaneLines(painter, s);
 
@@ -520,10 +615,16 @@ void NvgWindow::paintGL() {
     LOGW("slow frame rate: %.2f fps", fps);
   }
   prev_draw_t = cur_draw_t;
+
+  // publish debug msg
+  MessageBuilder msg;
+  auto m = msg.initEvent().initUiDebug();
+  m.setDrawTimeMillis(cur_draw_t - start_draw_t);
+  pm->send("uiDebug", msg);
 }
 
-void NvgWindow::showEvent(QShowEvent *event) {
-  CameraViewWidget::showEvent(event);
+void AnnotatedCameraWidget::showEvent(QShowEvent *event) {
+  CameraWidget::showEvent(event);
 
   ui_update_params(uiState());
   prev_draw_t = millis_since_boot();

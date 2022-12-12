@@ -10,7 +10,7 @@ import cereal.messaging as messaging
 from cereal.visionipc import VisionIpcServer, VisionStreamType
 from common.spinner import Spinner
 from common.timeout import Timeout
-from common.transformations.camera import get_view_frame_from_road_frame, tici_f_frame_size, tici_d_frame_size
+from common.transformations.camera import tici_f_frame_size, tici_d_frame_size
 from system.hardware import PC
 from selfdrive.manager.process_config import managed_processes
 from selfdrive.test.openpilotci import BASE_URL, get_url
@@ -20,14 +20,17 @@ from system.version import get_commit
 from tools.lib.framereader import FrameReader
 from tools.lib.logreader import LogReader
 
-TEST_ROUTE = "4cf7a6ad03080c90|2021-09-29--13-46-36"
-SEGMENT = 0
-MAX_FRAMES = 20 if PC else 1300
+TEST_ROUTE = "2f4452b03ccb98f0|2022-12-03--13-45-30"
+SEGMENT = 6
+MAX_FRAMES = 100 if PC else 600
+NAV_FRAMES = 50
 
+NO_NAV = "NO_NAV" in os.environ  # TODO: make map renderer work in CI
 SEND_EXTRA_INPUTS = bool(os.getenv("SEND_EXTRA_INPUTS", "0"))
 
 VIPC_STREAM = {"roadCameraState": VisionStreamType.VISION_STREAM_ROAD, "driverCameraState": VisionStreamType.VISION_STREAM_DRIVER,
                "wideRoadCameraState": VisionStreamType.VISION_STREAM_WIDE_ROAD}
+
 def get_log_fn(ref_commit, test_route):
   return f"{test_route}_model_tici_{ref_commit}.bz2"
 
@@ -35,8 +38,56 @@ def get_log_fn(ref_commit, test_route):
 def replace_calib(msg, calib):
   msg = msg.as_builder()
   if calib is not None:
-    msg.liveCalibration.extrinsicMatrix = get_view_frame_from_road_frame(*calib, 1.22).flatten().tolist()
+    msg.liveCalibration.rpyCalib = calib.tolist()
   return msg
+
+
+def nav_model_replay(lr):
+  sm = messaging.SubMaster(['navModel', 'navThumbnail'])
+  pm = messaging.PubMaster(['liveLocationKalman', 'navRoute'])
+
+  nav = [m for m in lr if m.which() == 'navRoute']
+  llk = [m for m in lr if m.which() == 'liveLocationKalman']
+  assert len(nav) > 0 and len(llk) >= NAV_FRAMES
+
+  log_msgs = []
+  try:
+    assert "MAPBOX_TOKEN" in os.environ
+    os.environ['MAP_RENDER_TEST_MODE'] = '1'
+    managed_processes['mapsd'].start()
+    managed_processes['navmodeld'].start()
+
+    # setup position and route
+    for _ in range(10):
+      for s in (llk, nav):
+        pm.send(s[0].which(), s[0].as_builder().to_bytes())
+      sm.update(1000)
+      if sm.updated['navModel']:
+        break
+      time.sleep(1)
+
+    if not sm.updated['navModel']:
+      raise Exception("no navmodeld outputs, failed to initialize")
+
+    # drain
+    time.sleep(2)
+    sm.update(0)
+
+    # run replay
+    for n in range(NAV_FRAMES):
+      pm.send(llk[n].which(), llk[n].as_builder().to_bytes())
+      m = messaging.recv_one(sm.sock['navThumbnail'])
+      assert m is not None, f"no navThumbnail, frame={n}"
+      log_msgs.append(m)
+
+      m = messaging.recv_one(sm.sock['navModel'])
+      assert m is not None, f"no navModel response, frame={n}"
+      log_msgs.append(m)
+  finally:
+    managed_processes['mapsd'].stop()
+    managed_processes['navmodeld'].stop()
+
+  return log_msgs
 
 
 def model_replay(lr, frs):
@@ -52,7 +103,7 @@ def model_replay(lr, frs):
   vipc_server.create_buffers(VisionStreamType.VISION_STREAM_WIDE_ROAD, 40, False, *(tici_f_frame_size))
   vipc_server.start_listener()
 
-  sm = messaging.SubMaster(['modelV2', 'driverState'])
+  sm = messaging.SubMaster(['modelV2', 'driverStateV2'])
   pm = messaging.PubMaster(['roadCameraState', 'wideRoadCameraState', 'driverCameraState', 'liveCalibration', 'lateralPlan'])
 
   try:
@@ -112,7 +163,7 @@ def model_replay(lr, frs):
             if min(frame_idxs['roadCameraState'], frame_idxs['wideRoadCameraState']) > recv_cnt['modelV2']:
               recv = "modelV2"
           elif msg.which() == 'driverCameraState':
-            recv = "driverState"
+            recv = "driverStateV2"
 
           # wait for a response
           with Timeout(15, f"timed out waiting for {recv}"):
@@ -149,13 +200,15 @@ if __name__ == "__main__":
   # load logs
   lr = list(LogReader(get_url(TEST_ROUTE, SEGMENT)))
   frs = {
-    'roadCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="fcamera")),
-    'driverCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="dcamera")),
-    'wideRoadCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="ecamera"))
+    'roadCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="fcamera"), readahead=True),
+    'driverCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="dcamera"), readahead=True),
+    'wideRoadCameraState': FrameReader(get_url(TEST_ROUTE, SEGMENT, log_type="ecamera"), readahead=True)
   }
 
-  # run replay
+  # run replays
   log_msgs = model_replay(lr, frs)
+  if not NO_NAV:
+    log_msgs += nav_model_replay(lr)
 
   # get diff
   failed = False
@@ -164,20 +217,36 @@ if __name__ == "__main__":
       ref_commit = f.read().strip()
     log_fn = get_log_fn(ref_commit, TEST_ROUTE)
     try:
-      cmp_log = list(LogReader(BASE_URL + log_fn))[:2*MAX_FRAMES]
+      expected_msgs = 2*MAX_FRAMES
+      if not NO_NAV:
+        expected_msgs += NAV_FRAMES*2
+      cmp_log = list(LogReader(BASE_URL + log_fn))[:expected_msgs]
 
       ignore = [
         'logMonoTime',
         'modelV2.frameDropPerc',
         'modelV2.modelExecutionTime',
-        'driverState.modelExecutionTime',
-        'driverState.dspExecutionTime'
+        'driverStateV2.modelExecutionTime',
+        'driverStateV2.dspExecutionTime',
+        'navModel.dspExecutionTime',
+        'navModel.modelExecutionTime',
+        'navThumbnail.timestampEof',
       ]
-      # TODO this tolerence is absurdly large
-      tolerance = 5e-1 if PC else None
+      if PC:
+        ignore += [
+          'modelV2.laneLines.0.t',
+          'modelV2.laneLines.1.t',
+          'modelV2.laneLines.2.t',
+          'modelV2.laneLines.3.t',
+          'modelV2.roadEdges.0.t',
+          'modelV2.roadEdges.1.t',
+        ]
+      # TODO this tolerance is absurdly large
+      tolerance = 2.0 if PC else None
       results: Any = {TEST_ROUTE: {}}
+      log_paths: Any = {TEST_ROUTE: {"models": {'ref': BASE_URL + log_fn, 'new': log_fn}}}
       results[TEST_ROUTE]["models"] = compare_logs(cmp_log, log_msgs, tolerance=tolerance, ignore_fields=ignore)
-      diff1, diff2, failed = format_diff(results, ref_commit)
+      diff1, diff2, failed = format_diff(results, log_paths, ref_commit)
 
       print(diff2)
       print('-------------\n'*5)

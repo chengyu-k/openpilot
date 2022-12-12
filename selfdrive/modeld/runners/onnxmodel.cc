@@ -14,12 +14,13 @@
 #include "common/swaglog.h"
 #include "common/util.h"
 
-ONNXModel::ONNXModel(const char *path, float *_output, size_t _output_size, int runtime, bool _use_extra) {
+ONNXModel::ONNXModel(const char *path, float *_output, size_t _output_size, int runtime, bool _use_extra, bool _use_tf8, cl_context context) {
   LOGD("loading model %s", path);
 
   output = _output;
   output_size = _output_size;
   use_extra = _use_extra;
+  use_tf8 = _use_tf8;
 
   int err = pipe(pipein);
   assert(err == 0);
@@ -28,11 +29,12 @@ ONNXModel::ONNXModel(const char *path, float *_output, size_t _output_size, int 
 
   std::string exe_dir = util::dir_name(util::readlink("/proc/self/exe"));
   std::string onnx_runner = exe_dir + "/runners/onnx_runner.py";
+  std::string tf8_arg = use_tf8 ? "--use_tf8" : "";
 
   proc_pid = fork();
   if (proc_pid == 0) {
     LOGD("spawning onnx process %s", onnx_runner.c_str());
-    char *argv[] = {(char*)onnx_runner.c_str(), (char*)path, nullptr};
+    char *argv[] = {(char*)onnx_runner.c_str(), (char*)path, (char*)tf8_arg.c_str(), nullptr};
     dup2(pipein[0], 0);
     dup2(pipeout[1], 1);
     close(pipein[0]);
@@ -95,6 +97,16 @@ void ONNXModel::addDesire(float *state, int state_size) {
   desire_state_size = state_size;
 }
 
+void ONNXModel::addNavFeatures(float *state, int state_size) {
+  nav_features_input_buf = state;
+  nav_features_size = state_size;
+}
+
+void ONNXModel::addDrivingStyle(float *state, int state_size) {
+    driving_style_input_buf = state;
+    driving_style_size = state_size;
+}
+
 void ONNXModel::addTrafficConvention(float *state, int state_size) {
   traffic_convention_input_buf = state;
   traffic_convention_size = state_size;
@@ -126,7 +138,13 @@ void ONNXModel::execute() {
   if (desire_input_buf != NULL) {
     pwrite(desire_input_buf, desire_state_size);
   }
-  if (traffic_convention_input_buf != NULL) {
+  if (nav_features_input_buf != NULL) {
+    pwrite(nav_features_input_buf, nav_features_size);
+  }
+  if (driving_style_input_buf != NULL) {
+    pwrite(driving_style_input_buf, driving_style_size);
+  }
+   if (traffic_convention_input_buf != NULL) {
     pwrite(traffic_convention_input_buf, traffic_convention_size);
   }
   if (calib_input_buf != NULL) {

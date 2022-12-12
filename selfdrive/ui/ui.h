@@ -8,6 +8,7 @@
 #include <QTimer>
 #include <QColor>
 #include <QFuture>
+#include <QPolygonF>
 #include <QTransform>
 
 #include "cereal/messaging/messaging.h"
@@ -19,13 +20,10 @@ const int bdr_s = 30;
 const int header_h = 420;
 const int footer_h = 280;
 
-const int UI_FREQ = 20;   // Hz
+const int UI_FREQ = 20; // Hz
 typedef cereal::CarControl::HUDControl::AudibleAlert AudibleAlert;
 
-// TODO: this is also hardcoded in common/transformations/camera.py
-// TODO: choose based on frame input size
-const float y_offset = 150.0;
-const float ZOOM = 2912.8;
+const mat3 DEFAULT_CALIBRATION = {{ 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0 }};
 
 struct Alert {
   QString text1;
@@ -80,34 +78,33 @@ typedef enum UIStatus {
 } UIStatus;
 
 const QColor bg_colors [] = {
-  [STATUS_DISENGAGED] =  QColor(0x17, 0x33, 0x49, 0xc8),
+  [STATUS_DISENGAGED] = QColor(0x17, 0x33, 0x49, 0xc8),
   [STATUS_OVERRIDE] = QColor(0x91, 0x9b, 0x95, 0xf1),
   [STATUS_ENGAGED] = QColor(0x17, 0x86, 0x44, 0xf1),
   [STATUS_WARNING] = QColor(0xDA, 0x6F, 0x25, 0xf1),
   [STATUS_ALERT] = QColor(0xC9, 0x22, 0x31, 0xf1),
 };
 
-typedef struct {
-  QPointF v[TRAJECTORY_SIZE * 2];
-  int cnt;
-} line_vertices_data;
-
 typedef struct UIScene {
-  mat3 view_from_calib;
+  bool calibration_valid = false;
+  bool calibration_wide_valid  = false;
+  bool wide_cam = true;
+  mat3 view_from_calib = DEFAULT_CALIBRATION;
+  mat3 view_from_wide_calib = DEFAULT_CALIBRATION;
   cereal::PandaState::PandaType pandaType;
 
   // modelV2
   float lane_line_probs[4];
   float road_edge_stds[2];
-  line_vertices_data track_vertices;
-  line_vertices_data lane_line_vertices[4];
-  line_vertices_data road_edge_vertices[2];
+  QPolygonF track_vertices;
+  QPolygonF lane_line_vertices[4];
+  QPolygonF road_edge_vertices[2];
 
   // lead
   QPointF lead_vertices[2];
 
-  float light_sensor, accel_sensor, gyro_sensor;
-  bool started, ignition, is_metric, longitudinal_control;
+  float light_sensor;
+  bool started, ignition, is_metric, map_on_left, longitudinal_control;
   uint64_t started_frame;
 } UIScene;
 
@@ -132,14 +129,16 @@ public:
   UIScene scene = {};
 
   bool awake;
-  int prime_type = 0;
+  int prime_type;
+  QString language;
 
   QTransform car_space_transform;
-  bool wide_camera;
+  bool wide_cam_only;
 
 signals:
   void uiUpdate(const UIState &s);
   void offroadTransition(bool offroad);
+  void primeTypeChanged(int prime_type);
 
 private slots:
   void update();
@@ -147,12 +146,12 @@ private slots:
 private:
   QTimer *timer;
   bool started_prev = false;
+  int prime_type_prev = -1;
 };
 
 UIState *uiState();
 
 // device management class
-
 class Device : public QObject {
   Q_OBJECT
 
@@ -160,9 +159,6 @@ public:
   Device(QObject *parent = 0);
 
 private:
-  // auto brightness
-  const float accel_samples = 5*UI_FREQ;
-
   bool awake = false;
   int interactive_timeout = 0;
   bool ignition_on = false;
@@ -185,3 +181,8 @@ public slots:
 };
 
 void ui_update_params(UIState *s);
+int get_path_length_idx(const cereal::ModelDataV2::XYZTData::Reader &line, const float path_height);
+void update_model(UIState *s, const cereal::ModelDataV2::Reader &model);
+void update_leads(UIState *s, const cereal::RadarState::Reader &radar_state, const cereal::ModelDataV2::XYZTData::Reader &line);
+void update_line_data(const UIState *s, const cereal::ModelDataV2::XYZTData::Reader &line,
+                      float y_off, float z_off, QPolygonF *pvd, int max_idx, bool allow_invert);
