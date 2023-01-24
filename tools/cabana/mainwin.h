@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QComboBox>
+#include <QDockWidget>
 #include <QJsonDocument>
 #include <QMainWindow>
 #include <QProgressBar>
@@ -11,6 +12,7 @@
 #include "tools/cabana/detailwidget.h"
 #include "tools/cabana/messageswidget.h"
 #include "tools/cabana/videowidget.h"
+#include "tools/cabana/tools/findsimilarbits.h"
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -26,6 +28,7 @@ public slots:
   void loadDBCFromFile();
   void loadDBCFromClipboard();
   void saveDBCToFile();
+  void saveAsDBCToFile();
   void saveDBCToClipboard();
 
 signals:
@@ -34,21 +37,26 @@ signals:
 
 protected:
   void createActions();
+  void createDockWindows();
+  QComboBox *createDBCSelector();
   void createStatusBar();
   void createShortcuts();
   void closeEvent(QCloseEvent *event) override;
+  void DBCFileChanged();
   void updateDownloadProgress(uint64_t cur, uint64_t total, bool success);
   void setOption();
+  void findSimilarBits();
 
-  VideoWidget *video_widget;
+  VideoWidget *video_widget = nullptr;
+  QDockWidget *video_dock;
   MessagesWidget *messages_widget;
   DetailWidget *detail_widget;
   ChartsWidget *charts_widget;
-  QSplitter *splitter;
   QWidget *floating_window = nullptr;
-  QVBoxLayout *r_layout;
+  QVBoxLayout *charts_layout;
   QProgressBar *progress_bar;
-  QLabel *fingerprint_label;
   QJsonDocument fingerprint_to_dbc;
   QComboBox *dbc_combo;
+  QSplitter *video_splitter;;
+  QString file_name = "";
 };

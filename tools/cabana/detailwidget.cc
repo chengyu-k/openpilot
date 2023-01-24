@@ -8,9 +8,9 @@
 #include <QTimer>
 
 #include "selfdrive/ui/qt/util.h"
-#include "tools/cabana/canmessages.h"
 #include "tools/cabana/commands.h"
 #include "tools/cabana/dbcmanager.h"
+#include "tools/cabana/streams/abstractstream.h"
 
 // DetailWidget
 
@@ -36,6 +36,7 @@ DetailWidget::DetailWidget(ChartsWidget *charts, QWidget *parent) : charts(chart
 
   // message title
   toolbar = new QToolBar(this);
+  toolbar->setIconSize({16, 16});
   toolbar->addWidget(new QLabel("time:"));
   time_label = new QLabel(this);
   time_label->setStyleSheet("font-weight:bold");
@@ -45,8 +46,8 @@ DetailWidget::DetailWidget(ChartsWidget *charts, QWidget *parent) : charts(chart
   name_label->setAlignment(Qt::AlignCenter);
   name_label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   toolbar->addWidget(name_label);
-  toolbar->addAction("🖍", this, &DetailWidget::editMsg)->setToolTip(tr("Edit Message"));
-  remove_msg_act = toolbar->addAction("X", this, &DetailWidget::removeMsg);
+  toolbar->addAction(bootstrapPixmap("pencil"), "", this, &DetailWidget::editMsg)->setToolTip(tr("Edit Message"));
+  remove_msg_act = toolbar->addAction(bootstrapPixmap("x-lg"), "", this, &DetailWidget::removeMsg);
   remove_msg_act->setToolTip(tr("Remove Message"));
   toolbar->setVisible(false);
   frame_layout->addWidget(toolbar);
@@ -86,7 +87,7 @@ DetailWidget::DetailWidget(ChartsWidget *charts, QWidget *parent) : charts(chart
   tab_widget = new QTabWidget(this);
   tab_widget->setTabPosition(QTabWidget::South);
   tab_widget->addTab(scroll, "&Msg");
-  history_log = new HistoryLog(this);
+  history_log = new LogsWidget(this);
   tab_widget->addTab(history_log, "&Logs");
   main_layout->addWidget(tab_widget);
 
@@ -98,7 +99,7 @@ DetailWidget::DetailWidget(ChartsWidget *charts, QWidget *parent) : charts(chart
   QObject::connect(binary_view, &BinaryView::resizeSignal, this, &DetailWidget::resizeSignal);
   QObject::connect(binary_view, &BinaryView::addSignal, this, &DetailWidget::addSignal);
   QObject::connect(tab_widget, &QTabWidget::currentChanged, [this]() { updateState(); });
-  QObject::connect(can, &CANMessages::msgsReceived, this, &DetailWidget::updateState);
+  QObject::connect(can, &AbstractStream::msgsReceived, this, &DetailWidget::updateState);
   QObject::connect(dbc(), &DBCManager::DBCFileChanged, [this]() { dbcMsgChanged(); });
   QObject::connect(tabbar, &QTabBar::customContextMenuRequested, this, &DetailWidget::showTabBarContextMenu);
   QObject::connect(tabbar, &QTabBar::currentChanged, [this](int index) {
@@ -107,8 +108,10 @@ DetailWidget::DetailWidget(ChartsWidget *charts, QWidget *parent) : charts(chart
     }
   });
   QObject::connect(tabbar, &QTabBar::tabCloseRequested, tabbar, &QTabBar::removeTab);
-  QObject::connect(charts, &ChartsWidget::chartOpened, [this](const QString &id, const Signal *sig) { updateChartState(id, sig, true); });
-  QObject::connect(charts, &ChartsWidget::chartClosed, [this](const QString &id, const Signal *sig) { updateChartState(id, sig, false); });
+  QObject::connect(charts, &ChartsWidget::seriesChanged, this, &DetailWidget::updateChartState);
+  QObject::connect(history_log, &LogsWidget::openChart, [this](const QString &id, const Signal *sig) {
+    this->charts->showChart(id, sig, true, false);
+  });
   QObject::connect(undo_stack, &QUndoStack::indexChanged, [this]() {
     if (undo_stack->count() > 0)
       dbcMsgChanged();
@@ -169,7 +172,7 @@ void DetailWidget::dbcMsgChanged(int show_form_idx) {
         signal_list.push_back(form);
       }
       form->setSignal(msg_id, sig);
-      form->setChartOpened(charts->isChartOpened(msg_id, sig));
+      form->setChartOpened(charts->hasSignal(msg_id, sig));
       ++i;
     }
     if (msg->size != can->lastMessage(msg_id).dat.size())
@@ -212,9 +215,9 @@ void DetailWidget::showForm(const Signal *sig) {
   setUpdatesEnabled(true);
 }
 
-void DetailWidget::updateChartState(const QString &id, const Signal *sig, bool opened) {
+void DetailWidget::updateChartState() {
   for (auto f : signal_list)
-    if (f->msg_id == id && f->sig == sig) f->setChartOpened(opened);
+    f->setChartOpened(charts->hasSignal(f->msg_id, f->sig));
 }
 
 void DetailWidget::editMsg() {
@@ -334,4 +337,3 @@ WelcomeWidget::WelcomeWidget(QWidget *parent) : QWidget(parent) {
 
   setStyleSheet("QLabel{color:darkGray;}");
 }
-

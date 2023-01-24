@@ -3,15 +3,17 @@
 #include <QBuffer>
 #include <QButtonGroup>
 #include <QDateTime>
-#include <QHBoxLayout>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QStyleOptionSlider>
+#include <QTimeEdit>
 #include <QTimer>
 #include <QToolTip>
 #include <QVBoxLayout>
 #include <QtConcurrent>
+
+#include "selfdrive/ui/qt/util.h"
 
 inline QString formatTime(int seconds) {
   return QDateTime::fromTime_t(seconds).toString(seconds > 60 * 60 ? "hh:mm:ss" : "mm:ss");
@@ -19,15 +21,19 @@ inline QString formatTime(int seconds) {
 
 VideoWidget::VideoWidget(QWidget *parent) : QWidget(parent) {
   QVBoxLayout *main_layout = new QVBoxLayout(this);
-  main_layout->setContentsMargins(0, 0, 0, 0);
+  QFrame *frame = new QFrame(this);
+  frame->setFrameShape(QFrame::StyledPanel);
+  frame->setFrameShadow(QFrame::Sunken);
+  main_layout->addWidget(frame);
 
-  cam_widget = new CameraWidget("camerad", can->visionStreamType(), false, this);
-  cam_widget->setFixedSize(parent->width(), parent->width() / 1.596);
-  main_layout->addWidget(cam_widget);
+  QVBoxLayout *frame_layout = new QVBoxLayout(frame);
+  cam_widget = new CameraWidget("camerad", can->visionStreamType(), false);
+  frame_layout->addWidget(cam_widget);
 
   // slider controls
-  QHBoxLayout *slider_layout = new QHBoxLayout();
-  QLabel *time_label = new QLabel("00:00");
+  slider_layout = new QHBoxLayout();
+  time_label = new ElidedLabel("00:00");
+  time_label->setToolTip(tr("Click to set current time"));
   slider_layout->addWidget(time_label);
 
   slider = new Slider(this);
@@ -36,12 +42,11 @@ VideoWidget::VideoWidget(QWidget *parent) : QWidget(parent) {
 
   end_time_label = new QLabel(this);
   slider_layout->addWidget(end_time_label);
-  main_layout->addLayout(slider_layout);
+  frame_layout->addLayout(slider_layout);
 
   // btn controls
   QHBoxLayout *control_layout = new QHBoxLayout();
-  play_btn = new QPushButton("⏸");
-  play_btn->setStyleSheet("font-weight:bold; height:16px");
+  play_btn = new QPushButton();
   control_layout->addWidget(play_btn);
 
   QButtonGroup *group = new QButtonGroup(this);
@@ -54,24 +59,45 @@ VideoWidget::VideoWidget(QWidget *parent) : QWidget(parent) {
     group->addButton(btn);
     if (speed == 1.0) btn->setChecked(true);
   }
-  main_layout->addLayout(control_layout);
+  frame_layout->addLayout(control_layout);
 
-  setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+  cam_widget->setMinimumHeight(100);
+  cam_widget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::MinimumExpanding);
+  setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
 
-  QObject::connect(can, &CANMessages::updated, this, &VideoWidget::updateState);
+  QObject::connect(time_label, &ElidedLabel::clicked, this, &VideoWidget::timeLabelClicked);
   QObject::connect(slider, &QSlider::sliderReleased, [this]() { can->seekTo(slider->value() / 1000.0); });
   QObject::connect(slider, &QSlider::valueChanged, [=](int value) { time_label->setText(formatTime(value / 1000)); });
-  QObject::connect(cam_widget, &CameraWidget::clicked, [this]() { pause(!can->isPaused()); });
-  QObject::connect(play_btn, &QPushButton::clicked, [=]() { pause(!can->isPaused()); });
-  QObject::connect(can, &CANMessages::streamStarted, [this]() {
+  QObject::connect(cam_widget, &CameraWidget::clicked, []() { can->pause(!can->isPaused()); });
+  QObject::connect(play_btn, &QPushButton::clicked, []() { can->pause(!can->isPaused()); });
+  QObject::connect(can, &AbstractStream::updated, this, &VideoWidget::updateState);
+  QObject::connect(can, &AbstractStream::paused, this, &VideoWidget::updatePlayBtnState);
+  QObject::connect(can, &AbstractStream::resume, this, &VideoWidget::updatePlayBtnState);
+  QObject::connect(can, &AbstractStream::streamStarted, [this]() {
     end_time_label->setText(formatTime(can->totalSeconds()));
     slider->setRange(0, can->totalSeconds() * 1000);
   });
+  updatePlayBtnState();
 }
 
-void VideoWidget::pause(bool pause) {
-  play_btn->setText(!pause ? "⏸" : "▶");
-  can->pause(pause);
+void VideoWidget::timeLabelClicked() {
+  auto time_edit = new QTimeEdit(this);
+  auto init_date_time = can->currentDateTime();
+  time_edit->setDateTime(init_date_time);
+  time_edit->setDisplayFormat("hh:mm:ss");
+  time_label->setVisible(false);
+  slider_layout->insertWidget(0, time_edit);
+  QTimer::singleShot(0, [=]() { time_edit->setFocus(); });
+
+  QObject::connect(time_edit, &QTimeEdit::editingFinished, [=]() {
+    if (time_edit->dateTime() != init_date_time) {
+      int seconds = can->route()->datetime().secsTo(time_edit->dateTime());
+      can->seekTo(seconds);
+    }
+    time_edit->setVisible(false);
+    time_label->setVisible(true);
+    time_edit->deleteLater();
+  });
 }
 
 void VideoWidget::rangeChanged(double min, double max, bool is_zoomed) {
@@ -88,6 +114,11 @@ void VideoWidget::updateState() {
     slider->setValue(can->currentSec() * 1000);
 }
 
+void VideoWidget::updatePlayBtnState() {
+  play_btn->setIcon(bootstrapPixmap(can->isPaused() ? "play" : "pause"));
+  play_btn->setToolTip(can->isPaused() ? tr("Play") : tr("Pause"));
+}
+
 // Slider
 Slider::Slider(QWidget *parent) : QSlider(Qt::Horizontal, parent) {
   QTimer *timer = new QTimer(this);
@@ -99,7 +130,12 @@ Slider::Slider(QWidget *parent) : QSlider(Qt::Horizontal, parent) {
   setMouseTracking(true);
 
   QObject::connect(can, SIGNAL(streamStarted()), timer, SLOT(start()));
-  QObject::connect(can, &CANMessages::streamStarted, this, &Slider::streamStarted);
+  QObject::connect(can, &AbstractStream::streamStarted, this, &Slider::streamStarted);
+}
+
+Slider::~Slider() {
+  abort_load_thumbnail = true;
+  thumnail_future.waitForFinished();
 }
 
 void Slider::streamStarted() {
